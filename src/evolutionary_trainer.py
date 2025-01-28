@@ -27,7 +27,7 @@ class GeneticAI:
                  output_size=10,
                  hidden_layers=[256, 128, 64, 32],  # Deeper architecture
                  activation_sequence=['tanh', 'sin', 'relu', 'tanh'],
-                 mutation_rate=0.20):
+                 mutation_rate=0.50):
         self.population_size = population_size
         self.mutation_rate = mutation_rate
         self.input_shape = input_shape
@@ -112,7 +112,7 @@ class GeneticAI:
         """Crossover using PyTorch tensor operations"""
         child = {}
         for key in parent1:
-            mask = torch.rand_like(parent1[key], device=DEVICE) > 0.5
+            mask = torch.rand_like(parent1[key], device=DEVICE) > 0.2
             child[key] = parent1[key] * mask + parent2[key] * (~mask)
         return child
 
