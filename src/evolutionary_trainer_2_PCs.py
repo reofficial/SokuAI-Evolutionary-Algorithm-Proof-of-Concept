@@ -23,38 +23,64 @@ class NetworkManager:
         self.role = role
         self.host = host
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.conn = None
+        self.sock = None
         self.lock = threading.Lock()
         
     def start_server(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind((self.host, self.port))
         self.sock.listen()
         print(f"Server listening on {self.host}:{self.port}")
-        self.conn, addr = self.sock.accept()
+        conn, addr = self.sock.accept()
+        self.conn = conn  # Store the connection object
         print(f"Connected to {addr}")
 
     def connect_client(self):
-        self.sock.connect((self.host, self.port))
-        print(f"Connected to server at {self.host}:{self.port}")
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        while True:
+            try:
+                self.sock.connect((self.host, self.port))
+                print(f"Connected to server at {self.host}:{self.port}")
+                return
+            except ConnectionRefusedError:
+                print("Connection failed, retrying in 3 seconds...")
+                time.sleep(3)
 
     def send_data(self, data):
         with self.lock:
-            # Convert tensors to serializable format
+            if self.role == 'server' and not self.conn:
+                raise ConnectionError("No client connected")
+            
+            # Use conn for server, sock for client
+            connection = self.conn if self.role == 'server' else self.sock
             serializable_data = self._convert_tensors(data)
             json_data = json.dumps(serializable_data)
             encoded = json_data.encode('utf-8')
-            self.conn.sendall(struct.pack('>I', len(encoded)))
-            self.conn.sendall(encoded)
+            connection.sendall(struct.pack('>I', len(encoded)))
+            connection.sendall(encoded)
 
     def receive_data(self):
         with self.lock:
-            raw_len = self.recvall(4)
+            if self.role == 'server' and not self.conn:
+                raise ConnectionError("No client connected")
+            
+            # Use conn for server, sock for client
+            connection = self.conn if self.role == 'server' else self.sock
+            raw_len = self.recvall(connection, 4)
             if not raw_len:
                 return None
             msg_len = struct.unpack('>I', raw_len)[0]
-            data = json.loads(self.recvall(msg_len).decode('utf-8'))
+            data = json.loads(self.recvall(connection, msg_len).decode('utf-8'))
             return self._restore_tensors(data)
+
+    def recvall(self, connection, n):
+        data = bytearray()
+        while len(data) < n:
+            packet = connection.recv(n - len(data))
+            if not packet:
+                return None
+            data.extend(packet)
+        return data
 
     def _convert_tensors(self, obj):
         if isinstance(obj, dict):
@@ -219,7 +245,7 @@ def train_client():
         return
 
     net_manager = NetworkManager(role='client', host='PC1_IP_ADDRESS')
-    net_manager.connect_client()
+    net_manager.connect_client()  # This now has retry logic
 
     ai = DistributedGeneticAI(network_manager=net_manager, population_size=20)
     frame_processor = FrameProcessor()
