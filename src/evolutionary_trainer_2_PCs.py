@@ -1,4 +1,3 @@
-# Add these new imports
 import torch
 import pickle
 import time
@@ -16,8 +15,8 @@ import socket
 import json
 import struct
 import threading
+import hashlib
 
-# Add this class for network communication
 class NetworkManager:
     def __init__(self, role='server', host='0.0.0.0', port=65432):
         self.role = role
@@ -25,62 +24,104 @@ class NetworkManager:
         self.port = port
         self.sock = None
         self.lock = threading.Lock()
+        self.timeout = 10  # Add timeout
+        self.connected = False
         
     def start_server(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.bind((self.host, self.port))
-        self.sock.listen()
-        print(f"Server listening on {self.host}:{self.port}")
-        conn, addr = self.sock.accept()
-        self.conn = conn  # Store the connection object
-        print(f"Connected to {addr}")
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.settimeout(self.timeout)
+            self.sock.bind((self.host, self.port))
+            self.sock.listen()
+            print(f"Server listening on {self.host}:{self.port}")
+            while True:
+                try:
+                    conn, addr = self.sock.accept()
+                    conn.settimeout(self.timeout)
+                    self.conn = conn
+                    self.connected = True
+                    print(f"Connected to {addr}")
+                    break
+                except socket.timeout:
+                    print("Waiting for client connection...")
+        except Exception as e:
+            print(f"Server setup error: {str(e)}")
+            raise
 
     def connect_client(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        while True:
+        while not self.connected:
             try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(self.timeout)
                 self.sock.connect((self.host, self.port))
+                self.connected = True
                 print(f"Connected to server at {self.host}:{self.port}")
-                return
-            except ConnectionRefusedError:
-                print("Connection failed, retrying in 3 seconds...")
+            except (ConnectionRefusedError, socket.timeout) as e:
+                print(f"Connection failed: {str(e)}, retrying in 3s...")
                 time.sleep(3)
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                raise
 
     def send_data(self, data):
-        with self.lock:
-            if self.role == 'server' and not self.conn:
-                raise ConnectionError("No client connected")
-            
-            # Use conn for server, sock for client
-            connection = self.conn if self.role == 'server' else self.sock
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        try:
+            # Add debug logging
+            print(f"[NET] Preparing to send data type: {type(data)}")
             serializable_data = self._convert_tensors(data)
             json_data = json.dumps(serializable_data)
+            print(f"[NET] Sending {len(json_data)} bytes")
             encoded = json_data.encode('utf-8')
-            connection.sendall(struct.pack('>I', len(encoded)))
-            connection.sendall(encoded)
+            # Add checksum
+            checksum = hashlib.md5(encoded).hexdigest()
+            header = struct.pack('>I16s', len(encoded), checksum.encode())
+            self._get_connection().sendall(header + encoded)
+        except Exception as e:
+            print(f"Send error: {str(e)}")
+            self.connected = False
+            raise
 
     def receive_data(self):
-        with self.lock:
-            if self.role == 'server' and not self.conn:
-                raise ConnectionError("No client connected")
-            
-            # Use conn for server, sock for client
-            connection = self.conn if self.role == 'server' else self.sock
-            raw_len = self.recvall(connection, 4)
-            if not raw_len:
+        try:
+            conn = self._get_connection()
+            # Receive header with checksum
+            header = self.recvall(conn, 4 + 16)  # 4 bytes length + 16 bytes MD5
+            if not header:
+                print("Connection closed by peer")
+                self.connected = False
                 return None
-            msg_len = struct.unpack('>I', raw_len)[0]
-            data = json.loads(self.recvall(connection, msg_len).decode('utf-8'))
-            return self._restore_tensors(data)
 
-    def recvall(self, connection, n):
-        data = bytearray()
-        while len(data) < n:
-            packet = connection.recv(n - len(data))
-            if not packet:
+            msg_len, checksum = struct.unpack('>I16s', header)
+            msg_len = int(msg_len)
+            checksum = checksum.decode()
+            
+            print(f"[NET] Expecting {msg_len} bytes")
+            encoded = self.recvall(conn, msg_len)
+            if not encoded:
+                print("Incomplete data received")
+                self.connected = False
                 return None
-            data.extend(packet)
-        return data
+
+            # Verify checksum
+            calc_checksum = hashlib.md5(encoded).hexdigest()
+            if calc_checksum != checksum:
+                print(f"Checksum mismatch: {calc_checksum} vs {checksum}")
+                self.connected = False
+                return None
+
+            data = json.loads(encoded.decode('utf-8'))
+            print(f"[NET] Received data type: {type(data)}")
+            return self._restore_tensors(data)
+        except socket.timeout:
+            print("Receive timeout")
+            self.connected = False
+            return None
+        except Exception as e:
+            print(f"Receive error: {str(e)}")
+            self.connected = False
+            raise
 
     def _convert_tensors(self, obj):
         if isinstance(obj, dict):
@@ -109,6 +150,16 @@ class NetworkManager:
             data.extend(packet)
         return data
 
+    def _get_connection(self):
+        if self.role == 'server':
+            if not self.conn:
+                raise ConnectionError("No client connection")
+            return self.conn
+        else:
+            if not self.sock:
+                raise ConnectionError("No server connection")
+            return self.sock
+
 # Modified GeneticAI class
 class DistributedGeneticAI(GeneticAI):
     def __init__(self, network_manager=None, **kwargs):
@@ -116,6 +167,10 @@ class DistributedGeneticAI(GeneticAI):
         self.network = network_manager
         
     def evolve_population_distributed(self, remote_fitness, remote_population):
+        print(f"[EVO] Starting evolution with {len(remote_population)} remote agents")
+        # Add validation
+        if len(self.population) + len(remote_population) != self.population_size * 1.5:
+            raise ValueError("Population size mismatch")
         combined_fitness = torch.cat([self.fitness_scores, remote_fitness])
         combined_population = self.population + remote_population
         
@@ -164,6 +219,8 @@ def train_server():
 
     try:
         while True:
+            print(f"Initial population size: {len(ai.population)}")
+            print(f"First agent structure: {ai.population[0].keys()}")
             print(f"\n--- Generation {ai.current_generation} ---")
             
             # Split population between local and remote
