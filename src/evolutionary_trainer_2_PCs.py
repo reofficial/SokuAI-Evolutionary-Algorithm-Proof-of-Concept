@@ -19,7 +19,7 @@ import threading
 
 # Add this class for network communication
 class NetworkManager:
-    def __init__(self, role='server', host='192.168.1.100', port=65432):
+    def __init__(self, role='server', host='0.0.0.0', port=65432):
         self.role = role
         self.host = host
         self.port = port
@@ -40,7 +40,9 @@ class NetworkManager:
 
     def send_data(self, data):
         with self.lock:
-            json_data = json.dumps(data)
+            # Convert tensors to serializable format
+            serializable_data = self._convert_tensors(data)
+            json_data = json.dumps(serializable_data)
             encoded = json_data.encode('utf-8')
             self.conn.sendall(struct.pack('>I', len(encoded)))
             self.conn.sendall(encoded)
@@ -51,7 +53,26 @@ class NetworkManager:
             if not raw_len:
                 return None
             msg_len = struct.unpack('>I', raw_len)[0]
-            return json.loads(self.recvall(msg_len).decode('utf-8'))
+            data = json.loads(self.recvall(msg_len).decode('utf-8'))
+            return self._restore_tensors(data)
+
+    def _convert_tensors(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._convert_tensors(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_tensors(v) for v in obj]
+        elif torch.is_tensor(obj):
+            return {'__tensor__': True, 'data': obj.cpu().tolist()}
+        return obj
+
+    def _restore_tensors(self, obj):
+        if isinstance(obj, dict):
+            if '__tensor__' in obj:
+                return torch.tensor(obj['data'])
+            return {k: self._restore_tensors(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._restore_tensors(v) for v in obj]
+        return obj
 
     def recvall(self, n):
         data = bytearray()
@@ -89,10 +110,12 @@ class DistributedGeneticAI(GeneticAI):
         self.current_generation += 1
 
     def tensor_to_cpu(self, tensor_dict):
-        return {k: v.cpu() for k, v in tensor_dict.items()}
+        return {k: v.cpu().tolist() if torch.is_tensor(v) else v 
+                for k, v in tensor_dict.items()}
 
     def tensor_to_device(self, tensor_dict):
-        return {k: v.to(DEVICE) for k, v in tensor_dict.items()}
+        return {k: torch.tensor(v, device=DEVICE) if isinstance(v, list) else v 
+                for k, v in tensor_dict.items()}
 
 # Modified train function for server (PC1)
 def train_server():
