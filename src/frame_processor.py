@@ -3,23 +3,12 @@ FrameProcessor
 
 This module captures, processes, and extracts features from game frames for AI decision-making.
 It prepares a sequence of the last 10 frames, processes them using YUV conversion and Sobel edge detection,
-and feeds them into a Convolutional Neural Network (CNN) to generate a 256-dimensional feature vector.
+and feeds them into an enhanced Convolutional Neural Network (CNN) to generate a 256-dimensional feature vector.
 
-Key Features:
-- Captures game frames and preprocesses them (YUV conversion, contrast enhancement, edge detection).
-- Maintains a rolling buffer of the last 10 frames for temporal awareness.
-- Resizes frames to 128×128 for efficient CNN processing.
-- Uses a CNN to extract meaningful game-state features.
-- Provides health bar detection to track player and opponent HP.
-
-Main Methods:
-- preprocess(frame): Converts a raw frame into a processed (128,128,4) format with Y, U, V, and edges.
-- update_frame_buffer(frame): Stores processed frames in a rolling buffer.
-- get_processed_input(): Returns the last 10 frames as a (128,128,40) NumPy array.
-- extract_features(): Passes stacked frames through the CNN and returns a 256-dimensional feature vector.
-- detect_health(frame): Extracts player and opponent HP from the frame.
-
-Designed for real-time performance in fighting game AI.
+Key Enhancements:
+- Uses a deeper CNN with an extra convolutional block and a residual connection.
+- Adds extra dropout to improve generalization.
+- Maintains the same external interface so that other files remain unchanged.
 """
 
 import cv2
@@ -34,30 +23,55 @@ from screen_capture import get_game_region, capture_screen
 class CNNFeatureExtractor(nn.Module):
     def __init__(self, input_channels=40, output_size=256, target_size=(128, 128)):
         super(CNNFeatureExtractor, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=8, stride=4, padding=2)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-
-        # Compute the flattened size dynamically
+        # Enhanced CNN: deeper architecture with a residual connection and additional dropout.
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=8, stride=4, padding=2),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.01)
+        )
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.01)
+        )
+        self.layer3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.01)
+        )
+        self.layer4 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.01)
+        )
+        # We'll add a residual connection: output of layer4 + output of layer3.
+        self.dropout = nn.Dropout(0.3)
+        
+        # Dynamically compute the flattened size after convolutions.
         with torch.no_grad():
             dummy = torch.zeros(1, input_channels, target_size[0], target_size[1])
-            out = self.conv1(dummy)
-            out = self.conv2(out)
-            out = self.conv3(out)
+            out = self.layer1(dummy)
+            out = self.layer2(out)
+            out3 = self.layer3(out)
+            out4 = self.layer4(out3)
+            # Residual addition:
+            out = out4 + out3
             flattened_size = out.view(1, -1).shape[1]
-
-        self.fc = nn.Linear(flattened_size, output_size)
-        self.dropout = nn.Dropout(0.3)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(flattened_size, output_size),
+            nn.ReLU(),
+            self.dropout
+        )
 
     def forward(self, x):
-        x = F.leaky_relu(self.bn1(self.conv1(x)), negative_slope=0.01)
-        x = F.leaky_relu(self.bn2(self.conv2(x)), negative_slope=0.01)
-        x = F.leaky_relu(self.bn3(self.conv3(x)), negative_slope=0.01)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x3 = self.layer3(x)
+        x4 = self.layer4(x3)
+        x = x4 + x3  # Residual connection improves gradient flow.
         x = x.view(x.size(0), -1)
-        x = self.dropout(F.relu(self.fc(x)))
+        x = self.fc(x)
         return x
     
 class FrameProcessor:
@@ -67,7 +81,7 @@ class FrameProcessor:
         self.frame_buffer = deque(maxlen=frame_stack)
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
-        # Health detection parameters
+        # Health detection parameters.
         self.health_y_range = (0.071, 0.10)
         self.player_x_range = (0.015, 0.41)
         self.opponent_x_range = (0.5925, 0.985)
@@ -80,7 +94,7 @@ class FrameProcessor:
             'upper': [179, 20, 80]
         }
         
-        # Instantiate the CNN for feature extraction.
+        # Instantiate the enhanced CNN for feature extraction.
         self.cnn = CNNFeatureExtractor(input_channels=self.frame_stack * 4, output_size=256, target_size=self.target_size)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.cnn.to(self.device)
@@ -90,18 +104,18 @@ class FrameProcessor:
         if not is_player1:
             frame = cv2.flip(frame, 1)
             
-        # Convert frame to YUV and apply CLAHE on the Y channel.
+        # Convert frame to YUV and enhance the Y channel with CLAHE.
         yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
         yuv[:, :, 0] = self.clahe.apply(yuv[:, :, 0])
         
-        # Compute Sobel edges
+        # Compute Sobel edges on the enhanced luminance channel.
         sobelx = cv2.Sobel(yuv[:, :, 0], cv2.CV_64F, 1, 0, ksize=5)
         sobely = cv2.Sobel(yuv[:, :, 0], cv2.CV_64F, 0, 1, ksize=5)
         edges = np.sqrt(sobelx**2 + sobely**2)
-        edges = edges / (np.max(edges) + 1e-6)  # Avoid division by zero
+        edges = edges / (np.max(edges) + 1e-6)  # Avoid division by zero.
         edges = np.clip(edges * 255, 0, 255).astype(np.uint8)
         
-        # Resize all channels to the target size.
+        # Resize each channel to the target size.
         def fast_resize(channel):
             return cv2.resize(channel, self.target_size, interpolation=cv2.INTER_AREA)
 
@@ -117,14 +131,15 @@ class FrameProcessor:
         self.frame_buffer.append(processed_frame)
 
     def get_processed_input(self):
-        
+        # Ensure the frame buffer is fully populated.
         while len(self.frame_buffer) < self.frame_stack:
             self.frame_buffer.appendleft(np.zeros((*self.target_size, 4), dtype=np.float32))
+        # Concatenate along the channel dimension.
         return np.concatenate(self.frame_buffer, axis=-1)
 
     def get_processed_input_tensor(self):
         processed = self.get_processed_input()  # Shape: (H, W, channels)
-        tensor = torch.from_numpy(processed).permute(2, 0, 1).unsqueeze(0)  # to (1, channels, H, W)
+        tensor = torch.from_numpy(processed).permute(2, 0, 1).unsqueeze(0)  # Convert to (1, channels, H, W)
         return tensor.to(self.device)
 
     def extract_features(self):
@@ -163,11 +178,11 @@ class FrameProcessor:
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             
             health_mask = cv2.inRange(hsv, 
-                                    np.array(self.health_color['lower']),
-                                    np.array(self.health_color['upper']))
+                                      np.array(self.health_color['lower']),
+                                      np.array(self.health_color['upper']))
             gray_mask = cv2.inRange(hsv, 
-                                np.array(self.gray_color['lower']),
-                                np.array(self.gray_color['upper']))
+                                    np.array(self.gray_color['lower']),
+                                    np.array(self.gray_color['upper']))
             
             combined_mask = cv2.bitwise_and(health_mask, cv2.bitwise_not(gray_mask))
             
@@ -193,7 +208,7 @@ class FrameProcessor:
                 
                 health = np.mean(filled_columns) / combined_mask.shape[1]
             
-            health_data[role] = np.clip(health, 0.0, 1.0)
+            health_data[role] = float(np.clip(health, 0.0, 1.0))
             
         return health_data
 

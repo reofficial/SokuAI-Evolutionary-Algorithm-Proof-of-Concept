@@ -9,32 +9,29 @@ import time
 
 def get_all_game_regions(window_title_part="Touhou Hisoutensoku", process_name="th123.exe"):
     hwnds = []
-    
-    # Find by window title
-    def callback(hwnd, _):
+    def enumHandler(hwnd, result):
         if win32gui.IsWindowVisible(hwnd) and window_title_part in win32gui.GetWindowText(hwnd):
-            hwnds.append(hwnd)
-        return True
-    win32gui.EnumWindows(callback, hwnds)
-    
-    # Sort by window position
-    hwnds.sort(key=lambda h: (win32gui.GetWindowRect(h)[0], win32gui.GetWindowRect(h)[1]))
-    
-    regions = []
-    for hwnd in hwnds[:4]:  # Max 4 instances
+            result.append(hwnd)
+    result = []
+    win32gui.EnumWindows(enumHandler, result)
+    instances = []
+    for hwnd in result:
         try:
-            rect = win32gui.GetWindowRect(hwnd)
-            regions.append({
+            # Get client rect as region
+            rect = win32gui.GetClientRect(hwnd)
+            client_left, client_top = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
+            client_right, client_bottom = win32gui.ClientToScreen(hwnd, (rect[2], rect[3]))
+            region = {
                 'hwnd': hwnd,
-                'left': rect[0],
-                'top': rect[1],
-                'width': rect[2]-rect[0],
-                'height': rect[3]-rect[1]
-            })
+                'left': client_left,
+                'top': client_top,
+                'width': client_right - client_left,
+                'height': client_bottom - client_top
+            }
+            instances.append(region)
         except Exception as e:
             print(f"Error processing window {hwnd}: {str(e)}")
-    
-    return regions
+    return instances
 
 def get_game_region(window_title_part="Touhou Hisoutensoku", process_name="th123.exe"):
     """Find window by partial title or process name"""
